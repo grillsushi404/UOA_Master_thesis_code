@@ -1,0 +1,727 @@
+---
+title: "whale_argos_data_pipeline"
+output: html_document
+---
+
+
+
+
+
+```{r warning=FALSE}
+
+library(ggplot2)
+library(lubridate)
+library(argosfilter)
+library(tidyr)
+library(plyr)
+library(dplyr)
+library(tidyverse)
+library(rnaturalearth)
+library(plotly)
+library(aniMotum)
+library(trip)
+library(viridis)
+
+
+world_map <- map_data("world")%>%fortify()
+
+sc <- scale_colour_gradientn(colours = viridis(100), limits=c(0,1))
+
+```
+
+
+
+```{r}
+# Load new raw data including 2020, 2021, 2022 until 2023/6/6
+# total of 57902 locs 
+
+raw_argos_df <- list.files(path="D:/auckland/nzsrw/maps/maps/raw_argos_07102023",pattern=".csv",full.names = TRUE)
+raw_argos_df<-lapply(raw_argos_df,read.csv)
+raw_argos_df<-do.call("rbind",raw_argos_df)
+
+#rename and remove columns we dont need 
+raw_argos_df <- raw_argos_df[c("Ptt", "Date", "Quality", "Longitude", "Latitude")]
+names(raw_argos_df) <- c("id", "date", "lc", "lon", "lat")
+
+# change date format from hh:mm:ss dd-mm-yyyy to yyyy-mm-dd hh:mm:ss
+
+dates <- strptime(raw_argos_df$date,format = "%H:%M:%S %d-%b-%Y")
+dates_changed <- format(dates,"%Y-%m-%d %H:%M:%S")
+raw_argos_df$date<- dates_changed
+
+raw_argos_df$date <-ymd_hms(raw_argos_df$date, tz = "GMT")
+
+remove(dates_changed)
+remove(dates)
+
+# Order the data by id and date
+raw_argos_df <- raw_argos_df[order(raw_argos_df$id, raw_argos_df$date),]
+
+# Take a quick peek 
+head(raw_argos_df)
+str(raw_argos_df)
+
+# number of whales in the dataset
+length(unique(raw_argos_df$id))
+# how many loc fixes we have for each individual 
+table(raw_argos_df$id)
+
+```
+
+```{r sda filter}
+
+# apply sda filter with vmax = 25 m/s 
+raw_argos_df <- ddply(raw_argos_df, ~id, function(d){
+      d$argosfilter <- sdafilter(lat = d$lat, 
+                               lon = d$lon, 
+                               lc = d$lc, 
+                               dtime = d$date, vmax = 25)
+        return(d)})
+
+#visualize 
+                
+ggplot()+
+  geom_point(data=data.frame(raw_argos_df[raw_argos_df$argosfilter=="not",]),aes(lon,lat),col ="blue")+
+  geom_point(data=data.frame(raw_argos_df[raw_argos_df$argosfilter=="removed",]),aes(lon,lat),col="red")+
+  geom_polygon(data=world_map,aes(x=long,y=lat,group=group))+
+  coord_fixed(xlim=c(160,170), ylim=c(-56,-45))+
+  theme_bw()+
+  theme(panel.grid=element_blank())
+
+#ggplotly()
+
+
+table(raw_argos_df$argosfilter)# removed n=5772 vmax=25
+
+#Subset to exclude the erroneous locations
+
+filtered_argos_df <- raw_argos_df %>% 
+  filter(argosfilter != "removed") %>% 
+  dplyr::select(-argosfilter)
+
+#Who is left? How many positions?
+filtered_argos_df %>% 
+  group_by(id) %>% 
+  dplyr::summarize(nb_locations = n())
+
+#How does that compare to the raw dataset?
+tab_1 <- raw_argos_df %>% 
+  group_by(id) %>% 
+  dplyr::summarize(nb_locations = n())
+
+tab_2 <- filtered_argos_df %>% 
+  group_by(id) %>% 
+  dplyr::summarize(nb_locations = n())
+
+tab  <- plyr::join(data.frame(tab_1), data.frame(tab_2), by="id")
+colnames(tab) <- c("id", "raw_locs", "filt_locs")
+tab
+
+#52130 locs left 
+
+```
+
+
+```{r remove duplicate}
+
+pre_dup <- nrow(filtered_argos_df) # to get the current number of data points
+
+# create dummy variable
+filtered_argos_df$index <- c(1:nrow(filtered_argos_df))
+
+# run each tag in a loop check to check for duplicates
+# if there is a time duplicate, select the best quality position or simply the first position
+filtered_argos_df <- ddply(filtered_argos_df, ~id, function(d){
+  toremove <- c()
+  for (i in c(2:nrow(d))) {
+    if (d$date[i] == d$date[i-1]) {
+      dd <- d[(i-1):i,]
+      r <- dd[dd$lc == ave(dd$lc, FUN = min), "index"] # find the lowest quality
+      toremove <- c(toremove, r[1]) #select first element of r in case both locations have the same lq
+    }
+  }
+  if (length(toremove) > 0){d <- d[!(d$index %in% toremove), ]}
+  return(d)
+})
+# remove dummy variable
+filtered_argos_df$index <- NULL
+pre_dup - nrow(filtered_argos_df) # to get an understanding of how many duplicates were removed
+
+# 1517 locations duplicate 
+# 50613 locations left 
+
+```
+
+```{r time difference}
+
+# Look at the time difference between locations
+
+time_diff_hours_df <- ddply(filtered_argos_df, ~id, function(d){
+  d$time_diff_hours <- NA
+  for (i in 2:nrow(d)){
+    d$time_diff_hours[i] = as.numeric(difftime(d$date[i], d$date[i-1], units = "hours"))}
+  return(d)
+})
+
+# mean time difference between locations (in hours)
+mts <- aggregate(time_diff_hours~id, time_diff_hours_df, mean)
+mts #this is the mean time step
+
+mxts <- aggregate(time_diff_hours~id, time_diff_hours_df, max)
+mxts# this is the max time step
+
+mnts <- aggregate(time_diff_hours~id, time_diff_hours_df, min)
+mnts # this is the minimum time step
+
+mets <- aggregate(time_diff_hours~id, time_diff_hours_df, median)
+mets # this is the median time step
+
+# track segments
+trackseg_argos_df <- ddply(time_diff_hours_df, ~id, function(d){
+ind <- which(d$time_diff_hours > 24)
+d$mark <- 0
+d$mark[ind] <- 1
+d$track_seg <- cumsum(d$mark)
+  return(d)
+})
+
+# Now create a new id based on track segment
+trackseg_argos_df$track_id <- paste(trackseg_argos_df$id, "-", trackseg_argos_df$track_seg, sep="")
+
+```
+
+```{r}
+# check overall
+ggplot(trackseg_argos_df, aes(lon, lat)) +
+  geom_point(size=0.5, aes(col = as.factor(track_id ))) +
+  geom_polygon(data=world_map,aes(x=long,y=lat,group=group))+
+  coord_fixed(xlim=c(160,180), ylim=c(-56,-45))+
+  theme_bw()+
+  theme(panel.grid=element_blank(),legend.position="none")
+ggplotly()
+
+# check individual 235399
+
+ggplot(trackseg_argos_df[trackseg_argos_df$id==235399,], aes(lon, lat)) +
+  geom_point(size=0.5, aes(col = as.factor(track_id ))) +
+  geom_polygon(data=world_map,aes(x=long,y=lat,group=group))+
+  coord_fixed(xlim=c(160,180), ylim=c(-56,-45))+
+  theme_bw()+
+  theme(panel.grid=element_blank())
+
+ggplotly()
+
+# check individual 46950
+ggplot(trackseg_argos_df[trackseg_argos_df$id==46950,], aes(lon, lat)) +
+  geom_point(size=0.5, aes(col = as.factor(track_id ))) +
+  geom_polygon(data=world_map,aes(x=long,y=lat,group=group))+
+  coord_fixed(xlim=c(160,180), ylim=c(-56,-45))+
+  theme_bw()+
+  theme(panel.grid=element_blank())
+
+# check individual 197853
+ggplot(trackseg_argos_df[trackseg_argos_df$id==197853,], aes(lon, lat)) +
+  geom_point(size=0.5, aes(col = as.factor(track_id ))) +
+  geom_polygon(data=world_map,aes(x=long,y=lat,group=group))+
+  coord_fixed(xlim=c(160,180), ylim=c(-56,-45))+
+  theme_bw()+
+  theme(panel.grid=element_blank())
+
+ggplotly()
+
+# check individual 203575
+ggplot(trackseg_argos_df[trackseg_argos_df$id==203575,], aes(lon, lat)) +
+  geom_point(size=0.5, aes(col = as.factor(track_id ))) +
+  geom_polygon(data=world_map,aes(x=long,y=lat,group=group))+
+  coord_fixed(xlim=c(160,180), ylim=c(-56,-45))+
+  theme_bw()+
+  theme(panel.grid=element_blank())
+
+```
+
+
+```{r remove observation < 10 and locations in June}
+
+min_obs <- 10 ## set the number of minimum obs acceptable
+trackseg_argos_df <- trackseg_argos_df %>% group_by(track_id)
+trackseg_argos_df_filt <- filter(trackseg_argos_df, n() >= min_obs)
+table(trackseg_argos_df_filt$track_id)
+
+# 50445 locations left
+
+# remove locations in June 2023 
+trackseg_argos_df_filt <- filter(trackseg_argos_df_filt,date < ymd_hms("2023-06-01 00:53:00",tz="GMT"))
+
+str(trackseg_argos_df_filt)
+
+#50276 locations left 
+
+```
+
+```{r}
+ssm_df <- trackseg_argos_df_filt[,c(2:5,9)]
+
+ssm_tdiff_hours_df <- ddply(ssm_df, ~track-id, function(d){
+  d$time_diff_hours <- NA
+  for (i in 2:nrow(d)){
+    d$time_diff_hours[i] = as.numeric(difftime(d$date[i], d$date[i-1], units = "hours"))}
+  return(d)
+})
+
+# mean time difference between locations (in hours)
+mts <- aggregate(time_diff_hours~ track-id, ssm_tdiff_hours_df, mean)
+mts #this is the mean time step
+mean(mts$time_diff_hours)
+
+# average 1 location every 3.6 hrs 
+
+```
+
+```{r}
+
+ssm_df <- ssm_df[,c(5,1:4)]
+colnames(ssm_df)[1] <- "id"
+ssm_df <- data.frame(ssm_df)
+
+# 50276 locations before running the ssm model 
+
+```
+
+
+2022 data 
+
+n=8
+
+Still transmitting
+197853
+235399
+235404
+
+Stop transmitting
+
+208742
+235400
+235401
+235402
+235403
+
+Removed 235399-8 as they gave WRONG move persistence estimates 
+
+Pre ssm = 16021
+Time step = 6h
+after ssm = 5635
+
+```{r ssm 2022}
+
+# whales were tagged in 2022 only 
+
+
+ssm_22 <- ssm_df%>%filter(date>"2022-07-01")
+
+table(ssm_22$id)
+
+#remove 215262 and 215258
+
+ssm_22<- ssm_22  %>% subset (id != "215262-18"&
+                            id != "215262-20"&
+                            id!="215262-22"&
+                            id!="215262-26"&
+                            id!="215262-27"&  
+                            id!="215262-30"&
+                            id!="215262-33"&
+                            id != "215258-9"&
+                            id != "215258-11"&
+                            id != "215258-13"&
+                            id != "215258-14"&
+                            id != "215258-16"&
+                            id != "215258-18"&
+                            id != "235399-8")
+
+# check again 
+length(unique(ssm_22$id))
+table(ssm_df$id)
+table(ssm_22$id)
+# calculate time difference 
+
+
+ssm_tdiff_hours_22_df <- ddply(ssm_22, ~ id, function(d){
+  d$time_diff_hours <- NA
+  for (i in 2:nrow(d)){
+    d$time_diff_hours[i] = as.numeric(difftime(d$date[i], d$date[i-1], units = "hours"))}
+  return(d)
+})
+
+# mean time difference between locations (in hours)
+mts <- aggregate(time_diff_hours ~ id, ssm_tdiff_hours_22_df, mean)
+mts #this is the mean time step
+mean(mts$time_diff_hours) #3.03 hrs
+
+
+
+# average time difference is 3 hrs 
+
+fit_ssm_6_22 <- fit_ssm(ssm_22,vmax = 25,model="crw",time.step = 6,control = ssm_control(verbose=0))
+
+
+print(fit_ssm_6_22)
+
+summary(fit_ssm_6_22)
+ssm_6_22_df <- grab(x=fit_ssm_6_22,what = "p")
+
+
+plot(fit_ssm_6_22,what="p",ask=F)
+
+# mpm 
+
+mpm_6_22 <- fit_mpm(fit_ssm_6_22,model = "mpm",control = mpm_control(verbose=0))
+
+
+mpm_6_22.df <- grab(mpm_6_22,what="f")
+
+# join ssm and mpm 
+ssm_mpm_22 <- aniMotum::join(fit_ssm_6_22,mpm_6_22,what="p",normalise=F)%>%
+              as.data.frame()
+
+ssm_mpm_22_a <- aniMotum::join(fit_ssm_6_22,mpm_6_22,what="p",normalise=F,group=F)%>%
+                as.data.frame()
+
+mean(ssm_mpm_22$g)
+
+
+  ggplot(data.frame(ssm_mpm_22), aes(lon, lat)) +
+    geom_point(size=1, aes(col = g)) +
+    geom_polygon(data = world_map, aes(x=long, y=lat, group=group), fill="black") +
+   coord_equal() + 
+    coord_fixed(xlim=c(160,180), ylim=c(-56,-45))+
+    theme_bw()+
+    theme(panel.grid=element_blank())+
+    sc
+  ggplotly()
+  
+  
+  ggplot(data.frame(ssm_mpm_22), aes(lon, lat))+
+    geom_point(size=1,aes(color=as.factor(id))) +
+    geom_polygon(data = world_map, aes(x=long, y=lat, group=group), fill="black") +
+   coord_equal() + 
+    coord_fixed(xlim=c(160,180), ylim=c(-56,-45))+
+    theme_bw()+
+    theme(panel.grid=element_blank())
+  ggplotly()
+  
+
+
+ lapply(ssm_mpm_22,summary)
+```
+
+2021 data 
+
+n=11
+
+46633
+46635
+46950
+46955
+212499
+212500
+215258
+215259
+215261
+215262
+215263
+
+Removed 46635-2 and 215258-9 and 215258-14 as they gave WRONG move persistence estimates due to insufficient data. Also, they were not in the study region 
+
+Pre ssm = 16738
+Time step = 6h
+After ssm = 4959
+Overall ssm = 5401 
+
+```{r ssm 2021}
+
+table(ssm_df$id)
+
+ssm_21 <-ssm_df %>% subset(id == "46633-0"| 
+                          id == "46635-0"| 
+                            
+                                 #id == "46635-2"| 
+                            
+                                 id == "46635-3"| 
+                          
+                                 id == "46950-0"|
+                                  
+                                 id == "46955-0"|
+                                 
+                                 id == "212499-0"|
+                                   
+                                 id == "212500-0"|
+                                   
+                                 id == "215258-0"|
+                                 id == "215258-1"|
+                                 id == "215258-3"|
+                                 id == "215258-4"|
+                                 #id == "215258-9"|
+                                 id == "215258-11"|
+                                 id == "215258-13"|
+                                #id == "215258-14"|
+                                 id == "215258-16"|
+                                   
+                                 id == "215259-0"|
+                                 id == "215259-1"|
+                                 id == "215259-2"|
+                                 id == "215259-3"|
+                                 id == "215259-5"|
+                                   
+                                 id == "215261-0"|
+                                 id == "215261-2"|
+                            
+                                 id == "215263-0")
+
+table(ssm_21$id)
+
+# calculate time difference 
+ssm_tdiff_hours_21_df <- ddply(ssm_21, ~ id, function(d){
+  d$time_diff_hours <- NA
+  for (i in 2:nrow(d)){
+    d$time_diff_hours[i] = as.numeric(difftime(d$date[i], d$date[i-1], units = "hours"))}
+  return(d)
+})
+
+# mean time difference between locations (in hours)
+mts <- aggregate(time_diff_hours ~ id, ssm_tdiff_hours_21_df, mean)
+mts #this is the mean time step
+mean(mts$time_diff_hours)
+
+# average time difference is 2.73 hrs
+
+
+fit_ssm_6_21 <-  fit_ssm(ssm_21,vmax = 25,model="crw",time.step =6,control = ssm_control(verbose=0))
+ssm_6_21.df <- fit_ssm_6_21%>%
+               grab(.,what="p")%>%
+               as.data.frame()
+
+
+
+# change longitude to 0-360 
+mpm_21<- ssm_6_21.df %>%
+              select(id,date,lon,lat)%>%
+               mutate(lon = lon %% 360) %>%
+               fit_mpm(., model = "mpm")
+mpm_21.df <- grab(x=mpm_21,what = "f") 
+
+ssm_mpm_21 <- aniMotum::join(fit_ssm_6_21,mpm_21,what="p")%>%
+              as.data.frame()
+
+ggplot(data.frame(ssm_mpm_21), aes(lon, lat)) +
+  geom_point(size=1, aes(col = g)) +
+  geom_polygon(data = world_map, aes(x=long, y=lat, group=group), fill="black") +
+ coord_equal() + 
+  coord_fixed(xlim=c(160,180), ylim=c(-56,-45))+
+  theme_bw()+
+  theme(panel.grid=element_blank())+
+  sc
+ggplotly()
+
+
+ggplot(data.frame(ssm_mpm_21), aes(lon, lat)) +
+  geom_point(size=1,aes(color=as.factor(id))) +
+  geom_polygon(data = world_map, aes(x=long, y=lat, group=group), fill="black") +
+ coord_equal() + 
+  coord_fixed(xlim=c(160,200), ylim=c(-56,-45))+
+  theme_bw()+
+  theme(panel.grid=element_blank())
+ 
+ggplotly()
+
+
+ lapply(ssm_mpm_21,summary)
+
+
+```
+
+
+Removed 215262-22 and 215262-27 as they gave WRONG move persistence estimates due to insufficient data. Also, they were not in the study region 
+
+Pre ssm = 1248
+Time difference = 5.99h
+Time step = 11h
+After ssm = 431
+
+
+215262-18 
+
+pre ssm = 22 
+time difference = 9.07h
+time step = 20h
+after ssm = 11
+
+```{r 2021 215262}
+
+
+table(ssm_df$id)
+
+ssm_215262 <- ssm_df %>% subset( id == "215262-0"|
+                                 id == "215262-1"|
+                                 id == "215262-2"|
+                                 id == "215262-4"|
+                                 id == "215262-6"|
+                                 id == "215262-7"|
+                                 id == "215262-9"|
+                                 id == "215262-12"|
+                                 id == "215262-13"|
+                                 id == "215262-14"|
+                                 id == "215262-15"|
+                                 id == "215262-16"|
+                               # id == "215262-18"|
+                                id == "215262-20"|
+                                #id =="215262-22"|
+                                id == "215262-26"|
+                                #id == "215262-27"|   
+                                id == "215262-30"|
+                                id == "215262-33")
+
+
+
+# calculate time difference 
+ssm_tdiff_hours_215262_df <- ddply(ssm_215262, ~ id, function(d){
+  d$time_diff_hours <- NA
+  for (i in 2:nrow(d)){
+    d$time_diff_hours[i] = as.numeric(difftime(d$date[i], d$date[i-1], units = "hours"))}
+  return(d)
+})
+
+# mean time difference between locations (in hours)
+mts <- aggregate(time_diff_hours ~ id, ssm_tdiff_hours_215262_df, mean)
+mts #this is the mean time step
+mean(mts$time_diff_hours)
+
+
+fit_ssm_215262 <- fit_ssm(ssm_215262,vmax = 25,model="crw",time.step =11,control = ssm_control(verbose=0))
+ssm_215262_df <- grab(x=fit_ssm_215262,what = "p") 
+
+#mpm
+mpm_215262 <- fit_mpm(fit_ssm_215262,model="mpm",control = mpm_control(verbose = 0))
+mpm_215262_df <- grab(x=mpm_215262,what = "f") 
+
+ssm_mpm_215262 <- aniMotum::join(fit_ssm_215262,mpm_215262,what="p")%>%
+              as.data.frame()
+
+
+# fit 215262-18 separately 
+
+ssm_215262_18 <- ssm_df%>% subset(id == "215262-18")
+
+# calculate time difference 
+ssm_tdiff_hours_215262_18_df <- ddply(ssm_215262_18, ~ id, function(d){
+  d$time_diff_hours <- NA
+  for (i in 2:nrow(d)){
+    d$time_diff_hours[i] = as.numeric(difftime(d$date[i], d$date[i-1], units = "hours"))}
+  return(d)
+})
+
+# mean time difference between locations (in hours)
+mts <- aggregate(time_diff_hours ~ id, ssm_tdiff_hours_215262_18_df, mean)
+mts #this is the mean time step
+mean(mts$time_diff_hours)
+
+
+# fit 215262-18
+fit_ssm_215262_18 <- fit_ssm(ssm_215262_18,vmax = 25,model="crw",time.step =20,control = ssm_control(verbose=0))
+ssm_215262_18_df <- grab(x=fit_ssm_215262_18,what = "p") 
+#mpm
+mpm_215262_18 <- fit_mpm(fit_ssm_215262_18,model="mpm",control = mpm_control(verbose = 0))
+mpm_215262_df <- grab(x=mpm_215262_18,what = "f") 
+
+
+ssm_mpm_215262_18 <- aniMotum::join(fit_ssm_215262_18,mpm_215262_18,what="p")%>%
+              as.data.frame()
+
+
+ssm_mpm_21 <- rbind(ssm_mpm_21,ssm_mpm_215262)
+ssm_mpm_21 <- rbind(ssm_mpm_21,ssm_mpm_215262_18)
+
+
+```
+
+2020 data 
+
+n=6
+
+203571
+203572
+203573
+203574
+203575
+205015
+
+Pre ssm = 16111 (w/o 203573-1)
+time difference = 1.81h
+Time step = 6h
+after ssm = 3750
+
+cant get fit_mpm work with 203573-1 
+
+pre ssm = 11 (203573-1)
+time difference = 2.89h 
+time step = 
+after ssm =
+
+```{r 2020}
+
+table(ssm_df$id)
+
+ssm_20 <- ssm_df %>% subset (id == "203571-0"|
+                             id == "203571-1"|
+                               
+                            id == "203572-0"|
+                            id == "203572-1"|
+                              
+                              id == "203573-0"|
+                                  #id == "203573-1"|
+                                    
+                                  id == "203574-0"|
+                                    
+                                  id == "203575-0"|
+                                  id == "203575-2"|
+                              
+                                  id == "205015-0")
+
+# calculate time difference 
+ssm_tdiff_hours_20_df <- ddply(ssm_20, ~ id, function(d){
+  d$time_diff_hours <- NA
+  for (i in 2:nrow(d)){
+    d$time_diff_hours[i] = as.numeric(difftime(d$date[i], d$date[i-1], units = "hours"))}
+  return(d)
+})
+
+# mean time difference between locations (in hours)
+mts <- aggregate(time_diff_hours ~ id, ssm_tdiff_hours_20_df, mean)
+mts #this is the mean time step
+mean(mts$time_diff_hours)
+
+fit_ssm_20<- fit_ssm(ssm_20, vmax=25, model="crw", time.step=6, control = ssm_control(verbose=0))
+ssm_20.df <- grab(fit_ssm_20,what="p") 
+
+mpm_20<- fit_mpm(fit_ssm_20,model="mpm",control = mpm_control(verbose = 0))
+mpm_20_df <- grab(x=mpm_20,what = "f") 
+
+ssm_mpm_20 <- aniMotum::join(fit_ssm_20,mpm_20,what="p")%>%
+              as.data.frame()
+
+ggplot(data.frame(ssm_mpm_20), aes(lon, lat)) +
+  geom_point(size=1,aes(color=g)) +
+  geom_polygon(data = world_map, aes(x=long, y=lat, group=group), fill="black") +
+ coord_equal() + 
+  coord_fixed(xlim=c(160,180), ylim=c(-56,-45))+
+  theme_bw()+sc+
+  theme(panel.grid=element_blank())
+ 
+ggplotly()
+
+
+ lapply(ssm_mpm_20,summary)
+
+
+```
+
+
+
