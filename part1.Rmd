@@ -1,0 +1,378 @@
+---
+title: "thesis code pt1"
+author: "Xuelei Zhang"
+date: "2024-03-15"
+output: html_document
+---
+
+#1 data cleaning for whale statellite telemetry data
+
+```{r}
+
+setwd("D:/auckland/github")
+
+
+library(ggplot2)
+suppressMessages(library(lubridate))
+library(argosfilter)
+library(tidyr)
+library(plyr)
+suppressMessages(library(dplyr))
+suppressMessages(library(tidyverse))
+library(rnaturalearth)
+
+suppressMessages(library(aniMotum))
+library(trip)
+library(viridis)
+
+
+world_map <- map_data("world")%>%fortify()
+
+sc <- scale_colour_gradientn(colours = viridis(100), limits=c(0,1))
+
+```
+
+
+```{r}
+# loading the raw data 
+# 57902 locs from 2020 to June 2023
+
+raw_argos_df <- list.files(path="D:/auckland/nzsrw/maps/maps/raw_argos_07102023",pattern=".csv",full.names = TRUE)
+raw_argos_df<-lapply(raw_argos_df,read.csv)
+raw_argos_df<-do.call("rbind",raw_argos_df)
+
+# remove and rename columns 
+raw_argos_df <- raw_argos_df[c("Ptt", "Date", "Quality", "Longitude", "Latitude")]
+names(raw_argos_df) <- c("id", "date", "lc", "lon", "lat")
+
+# change date format from hh:mm:ss dd-mm-yyyy to yyyy-mm-dd hh:mm:ss
+
+dates <- strptime(raw_argos_df$date,format = "%H:%M:%S %d-%b-%Y")
+dates_changed <- format(dates,"%Y-%m-%d %H:%M:%S")
+raw_argos_df$date<- dates_changed
+
+raw_argos_df$date <-ymd_hms(raw_argos_df$date, tz = "GMT")
+
+remove(dates_changed)
+remove(dates)
+
+# Order the data by id and date
+raw_argos_df <- raw_argos_df[order(raw_argos_df$id, raw_argos_df$date),]
+
+str(raw_argos_df)
+
+length(unique(raw_argos_df$id))
+
+table(raw_argos_df$id)
+
+```
+
+```{r sda filter}
+
+# apply sda filter 
+
+raw_argos_df <- ddply(raw_argos_df, ~id, function(d){
+      d$argosfilter <- sdafilter(lat = d$lat, 
+                               lon = d$lon, 
+                               lc = d$lc, 
+                               dtime = d$date, vmax = 25)
+        return(d)})
+
+
+#visualize 
+                
+ggplot()+
+  geom_point(data=data.frame(raw_argos_df[raw_argos_df$argosfilter=="not",]),aes(lon,lat),col ="blue")+
+  geom_point(data=data.frame(raw_argos_df[raw_argos_df$argosfilter=="removed",]),aes(lon,lat),col="red")+
+  geom_polygon(data=world_map,aes(x=long,y=lat,group=group))+
+  coord_fixed(xlim=c(160,180), ylim=c(-56,-45))+
+  theme_bw()+
+  theme(panel.grid=element_blank())
+
+
+#Subset to exclude the erroneous locations
+
+filtered_argos_df <- raw_argos_df %>% 
+  filter(argosfilter != "removed") %>% 
+  dplyr::select(-argosfilter)
+
+#Who is left? How many positions?
+filtered_argos_df %>% 
+  group_by(id) %>% 
+  dplyr::summarize(nb_locations = n())
+
+#How does that compare to the raw dataset?
+tab_1 <- raw_argos_df %>% 
+  group_by(id) %>% 
+  dplyr::summarize(nb_locations = n())
+
+tab_2 <- filtered_argos_df %>% 
+  group_by(id) %>% 
+  dplyr::summarize(nb_locations = n())
+
+tab  <- plyr::join(data.frame(tab_1), data.frame(tab_2), by="id")
+colnames(tab) <- c("id", "raw_locs", "filt_locs")
+tab
+
+#52130 locs left 
+
+```
+
+```{r remove duplicate locs}
+
+pre_dup <- nrow(filtered_argos_df) # to get the current number of data points
+
+# create dummy variable
+filtered_argos_df$index <- c(1:nrow(filtered_argos_df))
+
+# run each tag in a loop check to check for duplicates
+# if there is a time duplicate, select the best quality position or simply the first position
+filtered_argos_df <- ddply(filtered_argos_df, ~id, function(d){
+  toremove <- c()
+  for (i in c(2:nrow(d))) {
+    if (d$date[i] == d$date[i-1]) {
+      dd <- d[(i-1):i,]
+      r <- dd[dd$lc == ave(dd$lc, FUN = min), "index"] # find the lowest quality
+      toremove <- c(toremove, r[1]) #select first element of r in case both locations have the same lq
+    }
+  }
+  if (length(toremove) > 0){d <- d[!(d$index %in% toremove), ]}
+  return(d)
+})
+# remove dummy variable
+filtered_argos_df$index <- NULL
+pre_dup - nrow(filtered_argos_df) # to get an understanding of how many duplicates were removed
+
+# 1517 locations duplicate 
+# 50613 locations left 
+
+```
+
+```{r track segements}
+
+# Look at the time difference between locations
+
+time_diff_hours_df <- ddply(filtered_argos_df, ~id, function(d){
+  d$time_diff_hours <- NA
+  for (i in 2:nrow(d)){
+    d$time_diff_hours[i] = as.numeric(difftime(d$date[i], d$date[i-1], units = "hours"))}
+  return(d)
+})
+
+#  time difference between locations (in hours)
+mts <- aggregate(time_diff_hours~id, time_diff_hours_df, mean)
+
+mxts <- aggregate(time_diff_hours~id, time_diff_hours_df, max)
+
+mnts <- aggregate(time_diff_hours~id, time_diff_hours_df, min)
+
+mets <- aggregate(time_diff_hours~id, time_diff_hours_df, median)
+
+# track segments
+# a new segment is created if the time difference is greater than 24 hrs
+trackseg_argos_df <- ddply(time_diff_hours_df, ~id, function(d){
+ind <- which(d$time_diff_hours > 24)
+d$mark <- 0
+d$mark[ind] <- 1
+d$track_seg <- cumsum(d$mark)
+  return(d)
+})
+
+# Now create a new id based on track segment
+trackseg_argos_df$track_id <- paste(trackseg_argos_df$id, "-", trackseg_argos_df$track_seg, sep="")
+
+
+```
+
+# visualisation before running the ssm model
+
+```{r}
+
+# change longitude to 0-360 so the track went passed the 180E can be shown
+
+trackseg_argos_df <- trackseg_argos_df%>%
+                           mutate(lon=lon%%360)
+
+# overall 
+ggplot(trackseg_argos_df, aes(lon, lat)) +
+  geom_path(size=0.5, aes(col = as.factor(id ))) +
+  geom_polygon(data=world_map,aes(x=long,y=lat,group=group))+
+  coord_fixed(xlim=c(70,200), ylim=c(-85,-25))+
+  theme_bw()+
+  theme(panel.grid=element_blank(),legend.position="none")
+
+# by id
+ggplot() +
+  theme_bw() +
+  geom_path(size=0.15,aes(x = lon, y = lat,col=as.factor(id)), data = trackseg_argos_df) +
+  geom_polygon(data=world_map,aes(x=long,y=lat,group=group))+
+  coord_fixed(xlim=c(70,200), ylim=c(-85,-25))+
+  theme_bw()+
+  theme(panel.grid=element_blank(),legend.position="none")+
+  facet_wrap(~id)
+
+
+```
+
+# remove observation < 10 per track segments and locations in June
+
+```{r}
+
+min_obs <- 10 ## set the number of minimum obs acceptable
+trackseg_argos_df <- trackseg_argos_df %>% group_by(track_id)
+trackseg_argos_df_filt <- filter(trackseg_argos_df, n() >= min_obs)
+
+
+# 50445 locations left
+
+# remove locations in June 2023 
+trackseg_argos_df_filt <- filter(trackseg_argos_df_filt,date < ymd_hms("2023-06-01 00:53:00",tz="GMT"))
+
+
+
+#50276 locations left 
+
+```
+
+
+# prepare the file for fitting ssm model 
+
+```{r}
+
+ssm_df <- trackseg_argos_df_filt[,c(2:5,9)]
+
+ssm_tdiff_hours_df <- ddply(ssm_df, ~track_id, function(d){
+  d$time_diff_hours <- NA
+  for (i in 2:nrow(d)){
+    d$time_diff_hours[i] = as.numeric(difftime(d$date[i], d$date[i-1], units = "hours"))}
+  return(d)
+})
+
+# mean time difference between locations (in hours)
+mts <- aggregate(time_diff_hours~ track_id, ssm_tdiff_hours_df, mean)
+
+
+# average 1 location every 3.6 hrs 
+
+ssm_df <- ssm_df[,c(5,1:4)]
+colnames(ssm_df)[1] <- "id"
+ssm_df <- data.frame(ssm_df)
+
+
+```
+
+# using 2022 data (n=8) as example
+
+```{r}
+
+ssm_22 <- ssm_df%>%filter(date>"2022-07-01")
+
+#remove some track segs for 215262 abd 235399 as the model could not fit due to insufficient observations
+
+ssm_22<- ssm_22  %>% subset (id != "215262-18"&
+                            id != "215262-20"&
+                            id!="215262-22"&
+                            id!="215262-26"&
+                            id!="215262-27"&  
+                            id!="215262-30"&
+                            id!="215262-33"&
+                            id != "215258-9"&
+                            id != "215258-11"&
+                            id != "215258-13"&
+                            id != "215258-14"&
+                            id != "215258-16"&
+                            id != "215258-18"&
+                            id != "235399-8")
+
+# calculate time difference to determine time step parameter
+ssm_tdiff_hours_22_df <- ddply(ssm_22, ~ id, function(d){
+  d$time_diff_hours <- NA
+  for (i in 2:nrow(d)){
+    d$time_diff_hours[i] = as.numeric(difftime(d$date[i], d$date[i-1], units = "hours"))}
+  return(d)
+})
+
+# mean time difference between locations (in hours)
+mts <- aggregate(time_diff_hours ~ id, ssm_tdiff_hours_22_df, mean)
+mean(mts$time_diff_hours) #3.03 hrs
+
+fit_ssm_6_22 <- fit_ssm(ssm_22,vmax = 25,model="crw",time.step = 6,control = ssm_control(verbose=0))
+
+```
+
+# Visualise the model fit
+
+```{r}
+
+plot(fit_ssm_6_22,
+     what = "predicted",
+     type = 1,
+     pages = 0,ncol=2, ask=F)
+
+#The fitted points (orange) are overlayed on top of the observations (blue).
+
+# A 2-D plot of the model:
+plot(fit_ssm_6_22,
+     what = "predicted",
+     type = 2,
+      ncol = 8,ask=F)
+
+aniMotum::map(fit_ssm_6_22,
+              what = "predicted")
+
+# check the residual
+
+#res <- osar(fit_ssm_6_22)
+#plot(res, type = "ts", pages = 1) | plot(res, type = "qq", pages = 1) |   plot(res, type = "acf", pages = 1)
+```
+
+# fit the move persistence model 
+
+```{r}
+
+mpm_6_22 <- fit_mpm(fit_ssm_6_22,model = "mpm",control = mpm_control(verbose=0))
+
+plot(mpm_6_22,
+    ask=F)
+```
+
+# Data extraction 
+
+```{r}
+
+ssm_6_22_df <- grab(x=fit_ssm_6_22,what = "p")
+mpm_6_22.df <- grab(mpm_6_22,what="f")
+# join ssm and mpm 
+ssm_mpm_22 <- left_join(ssm_6_22_df,mpm_6_22.df)
+
+#save(ssm_mpm_22,file="D:/auckland/github/ssm_mp_22.Rdata")
+
+```
+
+# manual plotting
+
+```{r}
+library(sf)
+# Generate a global shapefile and a simple plot
+world_sf <- ne_countries(scale = "medium", returnclass = "sf")
+
+# To generate a plot with less distortion first define a projection i.e. EPSG 9191
+prj = "+proj=merc +lat_ts=-41 +lon_0=100 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs +type=crs"
+
+ssm_mpm_22.sf <- ssm_mpm_22 %>%
+                  st_as_sf(coords=c("lon","lat"))%>%
+                  st_set_crs(4326)
+
+st_bbox(world_sf)
+
+ggplot() +
+  theme_bw() +
+  geom_sf(aes(), data = world_sf) +
+  geom_sf(aes(colour = g), data = ssm_mpm_22.sf, show.legend = "point",size=0.5) +
+  scale_color_viridis_c(expression(gamma[t]), limits = c(0,1)) +
+  coord_sf(xlim=c(-5500000, 50000),ylim=c(-5000000, 200000), crs = 9191, expand = T) +
+  scale_x_continuous(breaks = seq(from = 60, to = 180, by = 30)) +
+  facet_wrap(~id,nrow=5,ncol=5)
+
+# Colouring the points by move persistence (γt) highlights periods when the animals were moving faster and more directed (lighter colours) and when the animals were travelling slower and less directed (darker).
+```
